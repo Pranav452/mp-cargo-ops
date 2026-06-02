@@ -97,4 +97,6 @@ export interface AppState {
   drafts: EmailDraft[]
   lastRun: TaskRun | null
   updatedAt: string
+  // threadId → historyId — tracks which threads Claude has already processed
+  seenThreads: Record<string, string>
 }

@@ -44,6 +44,20 @@ export interface RawMessage {
   body: string
 }
 
+// Lightweight — returns IDs + historyId only, no body fetch
+export async function listThreadsMeta(
+  query: string,
+  maxResults = 100
+): Promise<{ id: string; historyId: string; snippet: string }[]> {
+  const gmail = getGmailClient()
+  const res = await gmail.users.threads.list({ userId: 'me', q: query, maxResults })
+  return (res.data.threads ?? []).map((t) => ({
+    id: t.id!,
+    historyId: t.historyId ?? '',
+    snippet: t.snippet ?? '',
+  }))
+}
+
 export async function searchThreads(
   query: string,
   maxResults = 20

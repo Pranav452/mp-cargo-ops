@@ -1,9 +1,16 @@
 /**
- * Core task logic — mirrors the Cowork SKILL.md
- * Called by /api/cron (scheduled) and /api/run (manual trigger)
+ * Core task logic — incremental, batched, token-efficient
+ *
+ * Key optimizations:
+ * 1. seenThreads (KV) — skip threads Claude already processed + no new messages
+ * 2. listThreadsMeta first — get historyId without fetching bodies
+ * 3. Regex pre-filter — only threads with container pattern go to Claude
+ * 4. Batched Claude calls — 5 threads per call, 1.5s between batches
+ * 5. Parallel — NOA search + Release search run simultaneously
+ * 6. Wide windows (30d NOA, 90d Release) but only pay tokens for changed threads
  */
 
-import { searchThreads, createGmailDraft } from './gmail'
+import { listThreadsMeta, searchThreads, fetchThread, createGmailDraft, type RawThread } from './gmail'
 import {
   detectArrivalNotices,
   analyzeReleaseThreads,
@@ -17,6 +24,8 @@ import {
   addDraft,
   saveTaskRun,
   generateId,
+  getSeenThreads,
+  updateSeenThreads,
 } from './store'
 import { sendNotification } from './notify'
 import { log, logStart, logEnd } from './runlog'
@@ -27,6 +36,60 @@ const GILLES_EMAIL = 'zeebrugge@amragency.com'
 const INTERNAL_CC = 'airops2.lil@manilal.com'
 const CMA_DOCS = 'fra.documentation.import@cma-cgm.com'
 const CMA_SERVICE = 'bel.service@cma-cgm.com'
+
+// Container number pattern: 4 uppercase letters + 7 digits
+const CONTAINER_PATTERN = /[A-Z]{4}\d{7}/
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// ─── Batch helper ─────────────────────────────────────────────────────────────
+
+async function batchProcess<T, R>(
+  items: T[],
+  batchSize: number,
+  delayMs: number,
+  fn: (batch: T[]) => Promise<R[]>
+): Promise<R[]> {
+  const results: R[] = []
+  for (let i = 0; i < items.length; i += batchSize) {
+    if (i > 0) await sleep(delayMs)
+    const batch = items.slice(i, i + batchSize)
+    const res = await fn(batch)
+    results.push(...res)
+  }
+  return results
+}
+
+// ─── Get only NEW or CHANGED threads ─────────────────────────────────────────
+
+async function getChangedThreads(
+  query: string,
+  maxResults: number,
+  seenThreads: Record<string, string>,
+  requireContainerPattern = false
+): Promise<{ threads: RawThread[]; newSeen: Record<string, string> }> {
+  const meta = await listThreadsMeta(query, maxResults)
+
+  // Determine which threads are new or have changed (historyId changed = new message)
+  const changed = meta.filter((t) => {
+    if (seenThreads[t.id] === t.historyId) return false // unchanged
+    if (requireContainerPattern && !CONTAINER_PATTERN.test(t.snippet)) return false // no container in preview
+    return true
+  })
+
+  const newSeen: Record<string, string> = {}
+  meta.forEach((t) => { newSeen[t.id] = t.historyId })
+
+  if (changed.length === 0) return { threads: [], newSeen }
+
+  // Fetch full bodies only for changed threads
+  const fetched = await Promise.all(changed.map((t) => fetchThread(t.id)))
+  const threads = fetched.filter(Boolean) as RawThread[]
+
+  return { threads, newSeen }
+}
+
+// ─── Main task ────────────────────────────────────────────────────────────────
 
 export async function runDailyTask(): Promise<TaskRun> {
   const runId = generateId()
@@ -48,74 +111,86 @@ export async function runDailyTask(): Promise<TaskRun> {
 
   logStart()
   try {
-    // ─── PART 1: Arrival Notices ────────────────────────────────────────────
+    const seenThreads = await getSeenThreads()
+    log(`📂 Loaded ${Object.keys(seenThreads).length} previously seen threads`, 'info')
 
-    log('🔍 Connecting to Gmail…', 'step')
+    // ── PART 1 + 2 search in parallel ──────────────────────────────────────
+    log('🔍 Scanning Gmail — NOA emails + release threads in parallel…', 'step')
 
-    const noaQueries = [
-      'from:noreply@cma-cgm.com has:attachment newer_than:7d',
-      'from:fra.documentation.import@cma-cgm.com has:attachment newer_than:7d',
-      'from:ssc.beimport@cma-cgm.com has:attachment newer_than:7d',
-      'from:bel.service@cma-cgm.com has:attachment newer_than:7d',
-      '(subject:"avis d\'arrivée" OR subject:"NOA" OR subject:"arrival notice") newer_than:7d',
-    ]
+    const [noaResult, releaseResult, instrDouaneResult] = await Promise.all([
+      // NOA: 30d window, require container pattern in snippet
+      getChangedThreads(
+        'from:noreply@cma-cgm.com OR from:fra.documentation.import@cma-cgm.com OR from:ssc.beimport@cma-cgm.com OR from:bel.service@cma-cgm.com newer_than:30d',
+        50,
+        seenThreads,
+        true // must have container pattern in snippet
+      ),
+      // Release: 90d window
+      getChangedThreads(
+        'subject:"RELEASE REQUEST" after:2026/01/01',
+        80,
+        seenThreads,
+        false
+      ),
+      // Instruction Douane: lightweight metadata only
+      listThreadsMeta('subject:"INSTRUCTION DOUANE" newer_than:90d', 50),
+    ])
 
-    log('📬 Searching Gmail for CMA arrival notices (5 queries)…', 'step')
-    const noaThreadsRaw = await Promise.all(
-      noaQueries.map((q) => searchThreads(q, 5))
-    )
+    log(`📧 NOA: ${noaResult.threads.length} new/changed threads (skipped ${Object.keys(noaResult.newSeen).length - noaResult.threads.length} unchanged)`, 'info')
+    log(`📋 Release: ${releaseResult.threads.length} new/changed threads`, 'info')
 
-    // Deduplicate by thread ID
-    const seen = new Set<string>()
-    const noaThreads = noaThreadsRaw.flat().filter((t) => {
-      if (seen.has(t.id)) return false
-      seen.add(t.id)
-      return true
-    })
+    // ── PART 1: NOA Detection ───────────────────────────────────────────────
 
-    log(`📧 Found ${noaThreads.length} unique email threads to analyze`, 'info')
-    log('🤖 Claude reading emails — detecting arrival notices…', 'step')
-    const arrivalNotices = await detectArrivalNotices(noaThreads)
-    run.summary.arrivalNoticesFound = arrivalNotices.length
-    log(`✅ Found ${arrivalNotices.length} arrival notice(s)`, arrivalNotices.length > 0 ? 'ok' : 'info')
+    let arrivalNotices: Awaited<ReturnType<typeof detectArrivalNotices>> = []
 
-    // For each notice, check if Instruction Douane already sent, then draft
+    if (noaResult.threads.length > 0) {
+      log('🤖 Claude detecting arrival notices (batches of 5)…', 'step')
+
+      // Process NOA threads in batches of 5 to stay under TPM
+      arrivalNotices = (await batchProcess(
+        noaResult.threads,
+        5,
+        1500,
+        (batch) => detectArrivalNotices(batch)
+      )).flat()
+
+      // Deduplicate by container
+      const seen = new Map<string, typeof arrivalNotices[0]>()
+      arrivalNotices.forEach((n) => seen.set(n.container, n))
+      arrivalNotices = Array.from(seen.values())
+
+      run.summary.arrivalNoticesFound = arrivalNotices.length
+      log(`✅ Found ${arrivalNotices.length} arrival notice(s)`, arrivalNotices.length > 0 ? 'ok' : 'info')
+    } else {
+      log('⏭ No new NOA emails since last run — skipping Claude call', 'info')
+    }
+
+    // Draft Instruction Douane for each new notice
     const existingState = await getState()
     const existingNoaContainers = new Set(
-      existingState.containers
-        .filter((c) => c.noaToGilles)
-        .map((c) => c.container)
+      existingState.containers.filter((c) => c.noaToGilles).map((c) => c.container)
     )
 
     for (const notice of arrivalNotices) {
-      // Check for existing Instruction Douane thread
-      const existingThread = await searchThreads(
-        `subject:"INSTRUCTION DOUANE" "${notice.container}"`,
-        3
-      )
-
-      if (existingThread.length > 0) {
-        log(`⏭ ${notice.container} — Instruction Douane already sent, skipping`, 'info')
-        continue
-      }
-
       if (existingNoaContainers.has(notice.container)) {
         log(`⏭ ${notice.container} — already tracked, skipping`, 'info')
         continue
       }
+      const existingDraftCheck = existingState.drafts.find(
+        (d) => d.container === notice.container && d.type === 'instruction_douane'
+      )
+      if (existingDraftCheck) {
+        log(`⏭ ${notice.container} — draft already exists, skipping`, 'info')
+        continue
+      }
 
-      log(`✍️ Claude drafting Instruction Douane for ${notice.container} (${notice.consignee})…`, 'step')
+      log(`✍️ Drafting Instruction Douane for ${notice.container} (${notice.consignee})…`, 'step')
+      await sleep(1000) // rate limit buffer
       const { subject, body } = await draftInstructionDouane(notice)
 
-      log(`💾 Saving draft to Gmail for ${notice.container}…`, 'step')
-      const gmailDraftId = await createGmailDraft({
-        to: [GILLES_EMAIL],
-        cc: [INTERNAL_CC],
-        subject,
-        body,
-      })
+      log(`💾 Saving to Gmail drafts…`, 'step')
+      const gmailDraftId = await createGmailDraft({ to: [GILLES_EMAIL], cc: [INTERNAL_CC], subject, body })
 
-      // Save to our store
       const draft: EmailDraft = {
         id: generateId(),
         type: 'instruction_douane',
@@ -135,138 +210,123 @@ export async function runDailyTask(): Promise<TaskRun> {
       log(`✅ Draft created: ${subject.slice(0, 60)}`, 'ok')
     }
 
-    // ─── PART 2: Release Reminders ──────────────────────────────────────────
+    // ── PART 2: Release Analysis ────────────────────────────────────────────
 
-    log('🔍 Searching Gmail for release request threads…', 'step')
-
-    // Fetch release request threads
-    const releaseThreads = await searchThreads(
-      'subject:"RELEASE REQUEST" after:2026/03/01',
-      50
+    const instrDouaneSet = new Set(
+      instrDouaneResult
+        .map((t) => t.snippet.match(CONTAINER_PATTERN)?.[0])
+        .filter(Boolean) as string[]
     )
 
-    // Fetch Instruction Douane threads for cross-reference
-    const instrDouaneThreads = await searchThreads(
-      'subject:"INSTRUCTION DOUANE" newer_than:60d',
-      30
-    )
+    if (releaseResult.threads.length > 0) {
+      log(`🤖 Claude analyzing ${releaseResult.threads.length} changed release threads…`, 'step')
+      await sleep(2000) // let rate limit window reset a bit
 
-    log(`📋 Found ${releaseThreads.length} release threads + ${instrDouaneThreads.length} Instruction Douane threads`, 'info')
-    log('🤖 Claude analyzing all release threads — determining container status…', 'step')
-    const analyses = await analyzeReleaseThreads(releaseThreads, instrDouaneThreads)
-    run.summary.containersChecked = analyses.length
-    log(`✅ Analyzed ${analyses.length} container(s)`, 'ok')
+      // Process in batches of 10 (release analysis uses haiku = much cheaper)
+      const allAnalyses = (await batchProcess(
+        releaseResult.threads,
+        10,
+        1500,
+        (batch) => analyzeReleaseThreads(batch, [])
+      )).flat()
 
-    // Convert to Container objects and update store
-    const containers: Container[] = analyses.map((a) => ({
-      ...a,
-      updatedAt: new Date().toISOString(),
-    }))
+      run.summary.containersChecked = allAnalyses.length
 
-    await updateContainers(containers)
+      // Mark noaToGilles from Instruction Douane threads
+      const containers: Container[] = allAnalyses.map((a) => ({
+        ...a,
+        noaToGilles: a.noaToGilles || instrDouaneSet.has(a.container),
+        updatedAt: new Date().toISOString(),
+      }))
 
-    // Check which containers need a release reminder today (ETA = 7 days out)
-    const needsReminder = containers.filter((c) => {
-      if (c.status === 'resolved') return false
-      if (c.carrier !== 'CMA') return false // Only CMA uses bilingual template
-      try {
-        const eta = parseISO(c.eta)
-        const daysOut = differenceInDays(eta, today)
-        return daysOut === 7
-      } catch {
-        return false
-      }
-    })
+      await updateContainers(containers)
+      log(`✅ Updated ${containers.length} container(s) in KV`, 'ok')
 
-    // Also flag overdue (ETA within 7 days, no recent reminder)
-    const overdue = containers.filter((c) => {
-      if (c.status === 'resolved') return false
-      if (c.carrier !== 'CMA') return false
-      try {
-        const eta = parseISO(c.eta)
-        const daysOut = differenceInDays(eta, today)
-        return daysOut > 0 && daysOut < 7 && c.release === 'no_reply'
-      } catch {
-        return false
-      }
-    })
-
-    log(`⏰ ${needsReminder.length} container(s) need 7-day reminder, ${overdue.length} overdue`, 'info')
-    for (const container of [...needsReminder, ...overdue]) {
-      // Don't duplicate — check if we already drafted a reminder recently
-      const existingDraft = existingState.drafts.find(
-        (d) =>
-          d.container === container.container &&
-          d.type === 'release_reminder' &&
-          d.status === 'pending_review'
-      )
-      if (existingDraft) continue
-
-      log(`✍️ Drafting release reminder for ${container.container} (ETA ${container.eta})…`, 'step')
-      const { subject, body } = await draftReleaseReminder(container)
-
-      log(`💾 Saving release reminder to Gmail…`, 'step')
-      const gmailDraftId = await createGmailDraft({
-        to: [CMA_DOCS, CMA_SERVICE],
-        subject,
-        body,
-        replyToThreadId: container.threadId,
+      // Release reminders for ETA-7d and overdue
+      const allContainers = (await getState()).containers
+      const needsReminder = allContainers.filter((c) => {
+        if (c.status === 'resolved' || c.carrier !== 'CMA') return false
+        try {
+          const days = differenceInDays(parseISO(c.eta), today)
+          return days === 7
+        } catch { return false }
+      })
+      const overdue = allContainers.filter((c) => {
+        if (c.status === 'resolved' || c.carrier !== 'CMA') return false
+        try {
+          const days = differenceInDays(parseISO(c.eta), today)
+          return days > 0 && days < 7 && c.release === 'no_reply'
+        } catch { return false }
       })
 
-      const draft: EmailDraft = {
-        id: generateId(),
-        type: 'release_reminder',
-        status: 'pending_review',
-        container: container.container,
-        mbl: container.mbl,
-        to: [CMA_DOCS, CMA_SERVICE],
-        cc: [],
-        subject,
-        body,
-        gmailDraftId,
-        createdAt: new Date().toISOString(),
-      }
+      log(`⏰ ${needsReminder.length} needing 7-day reminder, ${overdue.length} overdue`, 'info')
 
-      await addDraft(draft)
-      run.summary.draftsCreated++
-      log(`✅ Release reminder draft created for ${container.container}`, 'ok')
+      for (const container of [...needsReminder, ...overdue]) {
+        const alreadyDrafted = existingState.drafts.find(
+          (d) => d.container === container.container && d.type === 'release_reminder' && d.status === 'pending_review'
+        )
+        if (alreadyDrafted) continue
+
+        log(`✍️ Drafting release reminder for ${container.container}…`, 'step')
+        const { subject, body } = await draftReleaseReminder(container)
+        const gmailDraftId = await createGmailDraft({
+          to: [CMA_DOCS, CMA_SERVICE],
+          subject,
+          body,
+          replyToThreadId: container.threadId,
+        })
+
+        await addDraft({
+          id: generateId(),
+          type: 'release_reminder',
+          status: 'pending_review',
+          container: container.container,
+          mbl: container.mbl,
+          to: [CMA_DOCS, CMA_SERVICE],
+          cc: [],
+          subject,
+          body,
+          gmailDraftId,
+          createdAt: new Date().toISOString(),
+        })
+        run.summary.draftsCreated++
+        log(`✅ Release reminder created for ${container.container}`, 'ok')
+      }
+    } else {
+      log('⏭ No changed release threads — skipping analysis, keeping existing container data', 'info')
+      run.summary.containersChecked = existingState.containers.length
     }
 
-    // ─── PART 3: Notifications ──────────────────────────────────────────────
+    // ── Save seen threads ────────────────────────────────────────────────────
+    await updateSeenThreads({ ...noaResult.newSeen, ...releaseResult.newSeen })
+    log(`💾 Updated seen thread cache (${Object.keys(noaResult.newSeen).length + Object.keys(releaseResult.newSeen).length} threads)`, 'info')
 
-    log('📊 Compiling final summary…', 'step')
+    // ── PART 3: Notifications ────────────────────────────────────────────────
     const finalState = await getState()
-    const criticalContainers = finalState.containers.filter(
-      (c) => c.status === 'critical'
-    )
+    const criticalContainers = finalState.containers.filter((c) => c.status === 'critical')
     run.summary.criticalItems = criticalContainers.length
 
     if (criticalContainers.length > 0 || arrivalNotices.length > 0) {
-      log('🤖 Claude generating daily briefing text…', 'step')
-      const summaryText = await generateDailySummary(
-        finalState.containers,
-        arrivalNotices,
-        run.summary.draftsCreated
-      )
-
+      log('🤖 Claude generating daily briefing…', 'step')
+      const summaryText = await generateDailySummary(finalState.containers, arrivalNotices, run.summary.draftsCreated)
       await sendNotification({
         subject: `[MP Cargo] Daily Briefing — ${criticalContainers.length} critical item(s)`,
         body: summaryText,
       })
-
       run.summary.notificationSent = true
-      log('📨 Email notification sent to Devanshi', 'ok')
+      log('📨 Notification sent', 'ok')
     }
 
     run.status = 'completed'
     run.completedAt = new Date().toISOString()
-    log(`🏁 Done — ${run.summary.arrivalNoticesFound} notices, ${run.summary.draftsCreated} drafts, ${run.summary.containersChecked} containers`, 'ok')
+    log(`🏁 Done — ${run.summary.arrivalNoticesFound} NOAs, ${run.summary.draftsCreated} drafts, ${run.summary.containersChecked} containers`, 'ok')
+
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
     run.status = 'failed'
     run.error = msg
     run.completedAt = new Date().toISOString()
-    log(`❌ Task failed: ${msg}`, 'error')
+    log(`❌ Failed: ${msg}`, 'error')
   } finally {
     logEnd()
   }

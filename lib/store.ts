@@ -14,6 +14,7 @@ const DEFAULT_STATE: AppState = {
   drafts: [],
   lastRun: null,
   updatedAt: new Date().toISOString(),
+  seenThreads: {},
 }
  
 // ─── Detect environment ───────────────────────────────────────────────────────
@@ -114,6 +115,17 @@ export async function updateDraft(
   await saveState({ ...state, drafts })
 }
  
+export async function updateSeenThreads(newSeen: Record<string, string>): Promise<void> {
+  const state = await getState()
+  const merged = { ...(state.seenThreads ?? {}), ...newSeen }
+  await saveState({ ...state, seenThreads: merged })
+}
+
+export async function getSeenThreads(): Promise<Record<string, string>> {
+  const state = await getState()
+  return state.seenThreads ?? {}
+}
+
 export async function saveTaskRun(run: TaskRun): Promise<void> {
   const state = await getState()
   await saveState({ ...state, lastRun: run })
