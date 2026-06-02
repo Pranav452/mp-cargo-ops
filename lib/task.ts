@@ -53,16 +53,16 @@ export async function runDailyTask(): Promise<TaskRun> {
     log('🔍 Connecting to Gmail…', 'step')
 
     const noaQueries = [
-      'from:noreply@cma-cgm.com has:attachment newer_than:60d',
-      'from:fra.documentation.import@cma-cgm.com has:attachment newer_than:60d',
-      'from:ssc.beimport@cma-cgm.com has:attachment newer_than:60d',
-      'from:bel.service@cma-cgm.com has:attachment newer_than:60d',
-      '(subject:"avis d\'arrivée" OR subject:"NOA" OR subject:"arrival notice") newer_than:60d',
+      'from:noreply@cma-cgm.com has:attachment newer_than:7d',
+      'from:fra.documentation.import@cma-cgm.com has:attachment newer_than:7d',
+      'from:ssc.beimport@cma-cgm.com has:attachment newer_than:7d',
+      'from:bel.service@cma-cgm.com has:attachment newer_than:7d',
+      '(subject:"avis d\'arrivée" OR subject:"NOA" OR subject:"arrival notice") newer_than:7d',
     ]
 
     log('📬 Searching Gmail for CMA arrival notices (5 queries)…', 'step')
     const noaThreadsRaw = await Promise.all(
-      noaQueries.map((q) => searchThreads(q, 10))
+      noaQueries.map((q) => searchThreads(q, 5))
     )
 
     // Deduplicate by thread ID

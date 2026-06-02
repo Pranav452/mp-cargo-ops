@@ -83,7 +83,7 @@ ${t.messages
   From: ${m.from}
   Date: ${m.date}
   Body:
-  ${m.body.slice(0, 3000)}
+  ${m.body.slice(0, 1200)}
 `
   )
   .join('')}
@@ -175,7 +175,7 @@ ${Array.from(noaSentContainers).join(', ') || 'none'}
 
 Threads to analyze (newest messages last in each thread):
 ${releaseThreads
-  .slice(0, 30)
+  .slice(0, 15)
   .map(
     (t, i) => `
 === THREAD ${i + 1} ===
