@@ -7,6 +7,27 @@ const client = new Anthropic({
   baseURL: 'https://api.anthropic.com',
 })
 
+// ─── Retry wrapper ────────────────────────────────────────────────────────────
+
+async function callWithRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 4
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (err: any) {
+      const status = err?.status ?? err?.error?.status
+      const isRetryable = status === 529 || status === 529 || err?.message?.includes('overloaded')
+      if (!isRetryable || attempt === maxRetries) throw err
+      const delay = Math.min(2000 * 2 ** attempt, 30000) // 2s, 4s, 8s, 16s, max 30s
+      console.log(`[Claude] Overloaded — retry ${attempt + 1}/${maxRetries} in ${delay}ms`)
+      await new Promise((r) => setTimeout(r, delay))
+    }
+  }
+  throw new Error('Max retries exceeded')
+}
+
 // ─── Arrival Notice Detection ─────────────────────────────────────────────────
 
 export async function detectArrivalNotices(
@@ -74,11 +95,11 @@ Return a JSON array of arrival notices. If no arrival notices are found, return 
 Only extract data that is explicitly present in the email text. Use empty string "" for missing fields.
 Return ONLY valid JSON, no explanation.`
 
-  const response = await client.messages.create({
+  const response = await callWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 4096,
     messages: [{ role: 'user', content: prompt }],
-  })
+  }))
 
   try {
     const text = response.content[0].type === 'text' ? response.content[0].text : ''
@@ -187,11 +208,11 @@ Return a JSON array. Each object must have:
 
 Return ONLY valid JSON array, no explanation.`
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+  const response = await callWithRetry(() => client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
     max_tokens: 8192,
     messages: [{ role: 'user', content: prompt }],
-  })
+  }))
 
   try {
     const text = response.content[0].type === 'text' ? response.content[0].text : ''
@@ -272,11 +293,11 @@ ${JSON.stringify(notice, null, 2)}
 Return JSON: { "subject": "...", "body": "..." }
 Return ONLY valid JSON, no explanation.`
 
-  const response = await client.messages.create({
+  const response = await callWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 2048,
     messages: [{ role: 'user', content: prompt }],
-  })
+  }))
 
   const text = response.content[0].type === 'text' ? response.content[0].text : ''
   const jsonMatch = text.match(/\{[\s\S]*\}/)
@@ -352,11 +373,11 @@ ${check.map((c) => `  • ${c.container} (${c.mbl}) — ETA ${c.eta} — ${c.las
 
 Write a short, direct briefing in Devanshi's voice: direct, clear, no fluff. Use plain text only. Start with the most urgent items. Max 300 words.`
 
-  const response = await client.messages.create({
+  const response = await callWithRetry(() => client.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 1024,
     messages: [{ role: 'user', content: prompt }],
-  })
+  }))
 
   return response.content[0].type === 'text' ? response.content[0].text : ''
 }
