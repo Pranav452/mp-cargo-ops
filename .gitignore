@@ -1,0 +1,21 @@
+# deps
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# env — NEVER commit secrets
+.env
+.env.local
+.env.*.local
+
+# local dev data store
+.local-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# misc
+*.log
